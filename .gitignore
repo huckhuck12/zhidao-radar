@@ -17,6 +17,7 @@ data/settings.json
 data/resources.json
 data/collected.json
 data/answered.json
+data/login_state.json
 
 # IDE
 .idea/

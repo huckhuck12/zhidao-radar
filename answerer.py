@@ -46,12 +46,14 @@ class Answerer:
         browser_path: str = "playwright-browsers",
         headless: bool = True,
         max_per_question: int = 3,
+        storage_state_path: str = "data/login_state.json",
         log_callback: Optional[Callable[[str], None]] = None,
     ):
         self.cookie = cookie
         self.browser_path = browser_path
         self.headless = headless
         self.max_per_question = max_per_question
+        self.storage_state_path = Path(storage_state_path)
         self.log_cb = log_callback or (lambda m: print(f"[answerer] {m}"))
 
         self._answered: dict[str, int] = self._load_answered()
@@ -87,16 +89,26 @@ class Answerer:
             # 指定本地浏览器路径，避免系统权限问题
             executable_path=self._find_chromium(),
         )
-        self._context = self._browser.new_context(
-            user_agent=(
+
+        # 优先用已保存的登录会话（Cookie + localStorage + sessionStorage 全套）
+        context_kwargs = {
+            "user_agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1280, "height": 800},
-        )
-        if self.cookie:
+            "viewport": {"width": 1280, "height": 800},
+        }
+        if self.storage_state_path.exists():
+            context_kwargs["storage_state"] = str(self.storage_state_path)
+            self.log_cb(f"已加载登录会话: {self.storage_state_path.name}")
+
+        self._context = self._browser.new_context(**context_kwargs)
+
+        # 没有会话文件但有 Cookie 字符串 → 用 Cookie 兜底
+        if not self.storage_state_path.exists() and self.cookie:
             self._inject_cookie(self.cookie)
+
         self._page = self._context.new_page()
         self.log_cb("浏览器已启动")
 

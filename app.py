@@ -64,15 +64,41 @@ with st.sidebar:
 
     settings = st.session_state["settings"]
 
-    # Cookie
-    cookie = st.text_area(
-        "🔑 百度 Cookie",
-        value=settings.get("baidu_cookie", ""),
-        height=120,
-        help="浏览器登录 zhidao.baidu.com 后，F12 → Network → 复制 Cookie 请求头整段字符串粘贴",
-    )
-    settings["baidu_cookie"] = cookie
-    config.save(settings)
+    # 登录状态指示器 + 手动登录按钮
+    st.markdown("#### 🔐 登录状态")
+    from pathlib import Path as _P
+    _login_state = _P("data/login_state.json")
+    if _login_state.exists():
+        st.success(f"✅ 已保存登录会话")
+        st.caption(f"文件: {_login_state.name}")
+        if st.button("🔄 重新登录", use_container_width=True):
+            import subprocess
+            subprocess.Popen(
+                [".\\venv\\Scripts\\python.exe", "login_helper.py"],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            st.info("已在新窗口打开浏览器，请按提示登录")
+    else:
+        st.warning("⚠️ 未登录，答题会失败")
+        if st.button("🔑 手动登录（推荐）", type="primary", use_container_width=True):
+            import subprocess
+            subprocess.Popen(
+                [".\\venv\\Scripts\\python.exe", "login_helper.py"],
+                creationflags=subprocess.CREATE_NEW_CONSOLE,
+            )
+            st.info("已在新窗口打开浏览器，登录完成后回到终端按回车保存")
+
+    # Cookie（备选方案）
+    with st.expander("🔑 高级：手动填 Cookie（备选）", expanded=False):
+        st.caption("仅当上方「手动登录」无法使用时才需要填这个")
+        cookie = st.text_area(
+            "百度 Cookie 字符串",
+            value=settings.get("baidu_cookie", ""),
+            height=100,
+            help="浏览器登录 zhidao.baidu.com 后，F12 → Network → 复制 Cookie 请求头整段字符串粘贴",
+        )
+        settings["baidu_cookie"] = cookie
+        config.save(settings)
 
     # 搜索词
     st.markdown("#### 🔍 搜索关键词")
@@ -359,9 +385,10 @@ with tab3:
     col1, col2 = st.columns([1, 3])
 
     with col1:
-        can_answer = bool(settings.get("baidu_cookie")) and bool(pairs)
-        if not settings.get("baidu_cookie"):
-            st.warning("⚠️ 先在左侧填入百度 Cookie")
+        has_login = _P("data/login_state.json").exists() or bool(settings.get("baidu_cookie"))
+        can_answer = has_login and bool(pairs)
+        if not has_login:
+            st.warning("⚠️ 先在左侧完成登录（点「手动登录」按钮）")
 
         if st.button("🚀 开始自动答题", disabled=not can_answer or st.session_state["is_answering"],
                      type="primary", use_container_width=True):
