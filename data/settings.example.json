@@ -1,0 +1,16 @@
+{
+  "baidu_cookie": "",
+  "search_queries": [
+    "求资源 百度云",
+    "求分享 网盘",
+    "谁有 下载",
+    "跪求 链接",
+    "求下载 资源"
+  ],
+  "max_questions_per_query": 30,
+  "request_interval": 3.0,
+  "answer_interval": 15.0,
+  "max_answers_per_question": 3,
+  "playwright_headless": true,
+  "playwright_browser_path": "playwright-browsers"
+}

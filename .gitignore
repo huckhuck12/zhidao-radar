@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+
+# Playwright 浏览器（体积大）
+playwright-browsers/
+
+# 运行时数据（含隐私）
+data/settings.json
+data/resources.json
+data/collected.json
+data/answered.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store

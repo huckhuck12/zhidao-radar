@@ -1,0 +1,19 @@
+{
+  "_comment": "资源库模板 —— 复制为 resources.json 后填入你的真实资源",
+  "resources": [
+    {
+      "category": "示例-电子书",
+      "keywords": ["三体", "刘慈欣", "科幻小说"],
+      "url": "https://pan.baidu.com/s/1example",
+      "password": "abcd",
+      "note": "《三体》全集，记得及时保存~"
+    },
+    {
+      "category": "示例-开发工具",
+      "keywords": ["idea", "intellij", "pycharm", "webstorm", "jetbrains"],
+      "url": "https://pan.baidu.com/s/1example2",
+      "password": "1234",
+      "note": "JetBrains 全家桶"
+    }
+  ]
+}
