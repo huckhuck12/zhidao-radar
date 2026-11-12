@@ -5,11 +5,11 @@
     streamlit run app.py --server.runOnSave true
 
 面板功能:
-    左侧 Sidebar  → Cookie / 搜索词 / 节流参数 配置
-    Tab 1 问题检索 → 搜索 → 分类 → 展示
+    左侧 Sidebar  → 运行模式（只读 / 答题）/ Cookie / 搜索词 / 节流参数
+    Tab 1 问题检索 → 搜索 → 分类 → 展示 → 导出
     Tab 2 资源库   → 增删改查资源
-    Tab 3 自动答题 → 匹配预览 → Dry Run → 开始答题（后台跑）
-    Tab 4 统计    → 答题数 / 成功率 / 命中分布 / 趋势图
+    Tab 3 自动答题 → 匹配预览 → Dry Run → 开始答题（仅答题模式）
+    Tab 4 统计    → 答题数 / 命中分布
 """
 
 import asyncio
@@ -32,8 +32,8 @@ from answerer import Answerer, AnswerLog
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="百度知道答题助手",
-    page_icon="🤖",
+    page_title="zhidao-radar",
+    page_icon="🎯",
     layout="wide",
 )
 
@@ -47,12 +47,15 @@ def _init_session():
     st.session_state.setdefault("log_msgs", [])       # 日志缓冲
     st.session_state.setdefault("is_collecting", False)
     st.session_state.setdefault("is_answering", False)
+    st.session_state.setdefault("mode", "read")        # read | answer
 
 
 _init_session()
 
 res_db = ResourceDB()
 classifier = QuestionClassifier()
+
+LOGIN_STATE_PATH = Path("data/login_state.json")
 
 # ---------------------------------------------------------------------------
 # Sidebar —— 配置面板
@@ -64,41 +67,56 @@ with st.sidebar:
 
     settings = st.session_state["settings"]
 
-    # 登录状态指示器 + 手动登录按钮
-    st.markdown("#### 🔐 登录状态")
-    from pathlib import Path as _P
-    _login_state = _P("data/login_state.json")
-    if _login_state.exists():
-        st.success(f"✅ 已保存登录会话")
-        st.caption(f"文件: {_login_state.name}")
-        if st.button("🔄 重新登录", use_container_width=True):
-            import subprocess
-            subprocess.Popen(
-                [".\\venv\\Scripts\\python.exe", "login_helper.py"],
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
-            st.info("已在新窗口打开浏览器，请按提示登录")
-    else:
-        st.warning("⚠️ 未登录，答题会失败")
-        if st.button("🔑 手动登录（推荐）", type="primary", use_container_width=True):
-            import subprocess
-            subprocess.Popen(
-                [".\\venv\\Scripts\\python.exe", "login_helper.py"],
-                creationflags=subprocess.CREATE_NEW_CONSOLE,
-            )
-            st.info("已在新窗口打开浏览器，登录完成后回到终端按回车保存")
+    # 运行模式
+    st.markdown("#### 🧭 运行模式")
+    mode_label = st.radio(
+        "选择模式",
+        ["📖 只读分析", "🤖 答题模式"],
+        index=0 if st.session_state["mode"] == "read" else 1,
+        label_visibility="collapsed",
+    )
+    mode = "read" if mode_label.startswith("📖") else "answer"
+    st.session_state["mode"] = mode
 
-    # Cookie（备选方案）
-    with st.expander("🔑 高级：手动填 Cookie（备选）", expanded=False):
-        st.caption("仅当上方「手动登录」无法使用时才需要填这个")
-        cookie = st.text_area(
-            "百度 Cookie 字符串",
-            value=settings.get("baidu_cookie", ""),
-            height=100,
-            help="浏览器登录 zhidao.baidu.com 后，F12 → Network → 复制 Cookie 请求头整段字符串粘贴",
-        )
-        settings["baidu_cookie"] = cookie
-        config.save(settings)
+    if mode == "read":
+        st.info("只采集 + 分析问题，**无需登录**。适合先调研都长什么样。")
+    else:
+        st.warning("需登录后才能提交回答。")
+
+    # 登录状态指示器 + 手动登录按钮（仅答题模式）
+    if mode == "answer":
+        st.markdown("#### 🔐 登录状态")
+        if LOGIN_STATE_PATH.exists():
+            st.success("✅ 已保存登录会话")
+            st.caption(f"文件: {LOGIN_STATE_PATH.name}")
+            if st.button("🔄 重新登录", use_container_width=True):
+                import subprocess
+                subprocess.Popen(
+                    [".\\venv\\Scripts\\python.exe", "login_helper.py"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+                st.info("已在新窗口打开浏览器，请按提示登录")
+        else:
+            st.warning("⚠️ 未登录，答题会失败")
+            if st.button("🔑 手动登录（推荐）", type="primary", use_container_width=True):
+                import subprocess
+                subprocess.Popen(
+                    [".\\venv\\Scripts\\python.exe", "login_helper.py"],
+                    creationflags=subprocess.CREATE_NEW_CONSOLE,
+                )
+                st.info("已在新窗口打开浏览器，登录完成后回到终端按回车保存")
+
+        # Cookie（备选方案）
+        with st.expander("🔑 高级：手动填 Cookie（备选）", expanded=False):
+            st.caption("仅当「手动登录」无法使用时才需要填这个")
+            cookie = st.text_area(
+                "百度 Cookie 字符串",
+                value=settings.get("baidu_cookie", ""),
+                height=100,
+                help="浏览器登录 zhidao.baidu.com 后，F12 → Network → 复制 Cookie 请求头整段字符串粘贴",
+            )
+            settings["baidu_cookie"] = cookie
+            config.save(settings)
 
     # 搜索词
     st.markdown("#### 🔍 搜索关键词")
@@ -123,28 +141,31 @@ with st.sidebar:
         min_value=1.0, max_value=30.0, step=1.0,
         value=float(settings.get("request_interval", 3.0)),
     )
-    settings["answer_interval"] = st.number_input(
-        "答题间隔（秒）",
-        min_value=5.0, max_value=120.0, step=5.0,
-        value=float(settings.get("answer_interval", 15.0)),
-    )
-    settings["max_answers_per_question"] = st.number_input(
-        "单条问题最多答几次",
-        min_value=1, max_value=10, step=1,
-        value=int(settings.get("max_answers_per_question", 3)),
-    )
-    settings["playwright_headless"] = st.checkbox(
-        "答题时无头模式",
-        value=settings.get("playwright_headless", True),
-        help="关掉就能看到浏览器在点什么，调试用",
-    )
+    if mode == "answer":
+        settings["answer_interval"] = st.number_input(
+            "答题间隔（秒）",
+            min_value=5.0, max_value=120.0, step=5.0,
+            value=float(settings.get("answer_interval", 15.0)),
+        )
+        settings["max_answers_per_question"] = st.number_input(
+            "单条问题最多答几次",
+            min_value=1, max_value=10, step=1,
+            value=int(settings.get("max_answers_per_question", 3)),
+        )
+        settings["playwright_headless"] = st.checkbox(
+            "答题时无头模式",
+            value=settings.get("playwright_headless", True),
+            help="关掉就能看到浏览器在点什么，调试用",
+        )
     config.save(settings)
 
     # 状态
     st.divider()
     st.markdown("#### 📊 当前状态")
+    st.write(f"运行模式: **{'📖 只读' if mode == 'read' else '🤖 答题'}**")
     st.write(f"资源库: **{len(res_db.resources)}** 条")
-    st.write(f"已答问题计数: **{len(Answerer._load_answered())}** 条")
+    if mode == "answer":
+        st.write(f"已答问题计数: **{len(Answerer._load_answered())}** 条")
 
 # ---------------------------------------------------------------------------
 # 日志辅助
@@ -241,6 +262,30 @@ with tab1:
         )
         st.dataframe(show_df, use_container_width=True, hide_index=True,
                      column_config={"链接": st.column_config.LinkColumn()})
+
+        # 只读模式：导出分析结果
+        if mode == "read":
+            st.markdown("#### 💾 导出结果")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    "⬇️ 下载 CSV",
+                    data=show_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"zhidao_questions_{time.strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with c2:
+                st.download_button(
+                    "⬇️ 下载 JSON（含正文）",
+                    data=json.dumps(
+                        [q.to_dict() | {"snippet": q.snippet} for q in st.session_state["questions"]],
+                        ensure_ascii=False, indent=2,
+                    ).encode("utf-8"),
+                    file_name=f"zhidao_questions_{time.strftime('%Y%m%d_%H%M')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
     else:
         st.info("还没采集到数据，点左侧按钮开始吧~")
 
@@ -323,7 +368,7 @@ with tab2:
 # ============================================================
 # Tab 3 —— 自动答题
 # ============================================================
-with tab3:
+def _render_answer_tab():
     st.header("🚀 自动答题")
     st.caption("对已采集的资源需求问题，用资源库匹配生成答案，再用 Playwright 模拟浏览器提交")
 
@@ -371,13 +416,6 @@ with tab3:
         answer_text = res.build_answer_text(q.title)
         st.code(answer_text, language="text")
 
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if st.button("🎯 答题预览 OK，准备开始", type="secondary", disabled=True):
-                pass
-        with col_b:
-            pass
-
     st.divider()
 
     # 开始答题
@@ -385,7 +423,7 @@ with tab3:
     col1, col2 = st.columns([1, 3])
 
     with col1:
-        has_login = _P("data/login_state.json").exists() or bool(settings.get("baidu_cookie"))
+        has_login = LOGIN_STATE_PATH.exists() or bool(settings.get("baidu_cookie"))
         can_answer = has_login and bool(pairs)
         if not has_login:
             st.warning("⚠️ 先在左侧完成登录（点「手动登录」按钮）")
@@ -427,7 +465,6 @@ with tab3:
     with col2:
         if st.session_state["is_answering"]:
             st.info("⏳ 答题进行中...实时日志在下方")
-        # 实时日志（每次刷新面板都会重新渲染，所以自动答题时需要定时触发 rerun）
         if st.session_state["log_msgs"]:
             st.text_area("📋 实时日志",
                          "\n".join(reversed(st.session_state["log_msgs"][-80:])),
@@ -444,6 +481,24 @@ with tab3:
         show_cols = [c for c in show_cols if c in df_logs.columns]
         st.dataframe(df_logs[show_cols], use_container_width=True, hide_index=True,
                      column_config={"url": st.column_config.LinkColumn()})
+
+
+with tab3:
+    if mode == "read":
+        st.header("🚀 自动答题")
+        st.info("当前是 **只读分析模式**，答题功能已关闭。")
+        st.markdown("""
+**两种模式的区别**
+
+| 模式 | 需要登录 | 能做什么 |
+|---|---|---|
+| 📖 只读分析 | ❌ | 采集问题、分类、资源匹配预览、导出 CSV/JSON |
+| 🤖 答题模式 | ✅ | 以上全部 + 用 Playwright 模拟浏览器自动提交回答 |
+
+切换到左侧「🤖 答题模式」并完成登录后，这里会显示匹配预览、Dry Run 和答题按钮。
+""")
+    else:
+        _render_answer_tab()
 
 # ============================================================
 # Tab 4 —— 统计仪表盘
