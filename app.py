@@ -44,7 +44,6 @@ def _init_session():
     st.session_state.setdefault("resource_qs", [])     # List[Question] 筛选后
     st.session_state.setdefault("matched_pairs", [])   # [(Question, Resource, score)]
     st.session_state.setdefault("answer_logs", [])     # List[AnswerLog]
-    st.session_state.setdefault("log_msgs", [])       # 日志缓冲
     st.session_state.setdefault("is_collecting", False)
     st.session_state.setdefault("is_answering", False)
     st.session_state.setdefault("mode", "read")        # read | answer
@@ -168,15 +167,91 @@ with st.sidebar:
         st.write(f"已答问题计数: **{len(Answerer._load_answered())}** 条")
 
 # ---------------------------------------------------------------------------
-# 日志辅助
+# 日志系统 —— 结构化分级日志
 # ---------------------------------------------------------------------------
 
-def log(msg: str):
-    """往 session_state 里追加一条日志"""
-    st.session_state["log_msgs"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
-    # 保留最近 500 条
-    if len(st.session_state["log_msgs"]) > 500:
-        st.session_state["log_msgs"] = st.session_state["log_msgs"][-500:]
+LOG_LEVELS = {
+    "debug": ("🔍", "调试"),
+    "info": ("ℹ️", "信息"),
+    "success": ("✅", "成功"),
+    "warn": ("⚠️", "警告"),
+    "error": ("❌", "错误"),
+}
+
+# 用模块级缓冲区而不是 session_state：后台线程写日志时更安全
+_LOG_LOCK = threading.Lock()
+LOG_BUFFER: list = []
+
+
+def log(msg: str, level: str = "info"):
+    """追加一条结构化日志，level ∈ debug/info/success/warn/error"""
+    with _LOG_LOCK:
+        LOG_BUFFER.append({
+            "ts": time.time(),
+            "level": level if level in LOG_LEVELS else "info",
+            "msg": msg,
+        })
+        if len(LOG_BUFFER) > 1000:
+            del LOG_BUFFER[:-1000]
+
+
+def _fmt_log(entry: dict) -> str:
+    icon, _ = LOG_LEVELS[entry["level"]]
+    t = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
+    return f"{t} {icon} {entry['msg']}"
+
+
+@st.fragment(run_every=2.0)
+def render_logs(key: str, height: int = 320):
+    """渲染日志面板：级别过滤 + 下载（每 2 秒自动刷新，采集/答题时可实时看进度）"""
+    with _LOG_LOCK:
+        logs = list(LOG_BUFFER)
+    if not logs:
+        st.caption("暂无日志")
+        return
+
+    # 统计各等级条数
+    counts = {}
+    for e in logs:
+        counts[e["level"]] = counts.get(e["level"], 0) + 1
+    summary = " | ".join(
+        f"{LOG_LEVELS[lv][0]} {LOG_LEVELS[lv][1]} {counts.get(lv, 0)}"
+        for lv in ["info", "success", "warn", "error", "debug"]
+        if counts.get(lv)
+    )
+    st.caption(f"共 {len(logs)} 条　{summary}")
+
+    selected = st.multiselect(
+        "日志级别",
+        options=list(LOG_LEVELS.keys()),
+        default=list(LOG_LEVELS.keys()),   # 默认全部显示，含调试明细
+        format_func=lambda lv: f"{LOG_LEVELS[lv][0]} {LOG_LEVELS[lv][1]}",
+        key=f"{key}_levels",
+        label_visibility="collapsed",
+    )
+
+    filtered = [e for e in logs if e["level"] in selected]
+    text = "\n".join(_fmt_log(e) for e in filtered[-400:]) or "（当前过滤条件下无日志）"
+    st.text_area(
+        "日志内容", value=text, height=height, disabled=True,
+        key=f"{key}_text", label_visibility="collapsed",
+    )
+
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        st.download_button(
+            "⬇️ 导出日志",
+            data="\n".join(_fmt_log(e) for e in logs).encode("utf-8"),
+            file_name=f"log_{time.strftime('%Y%m%d_%H%M')}.txt",
+            mime="text/plain",
+            key=f"{key}_dl",
+            use_container_width=True,
+        )
+    with c2:
+        if st.button("🧹 清空日志", key=f"{key}_clear", use_container_width=True):
+            with _LOG_LOCK:
+                LOG_BUFFER.clear()
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -199,43 +274,78 @@ with tab1:
         if st.button("🚀 开始采集", disabled=st.session_state["is_collecting"],
                      type="primary", use_container_width=True):
             st.session_state["is_collecting"] = True
-            log("开始采集问题...")
 
             def _run():
+                t_start = time.time()
                 try:
+                    log(f"开始采集：{len(settings['search_queries'])} 个搜索词，"
+                        f"每词上限 {settings['max_questions_per_query']} 条", "info")
+                    log(f"节流配置：检索间隔 {settings['request_interval']}s", "debug")
+
                     qs = asyncio.run(collect_questions(
                         queries=settings["search_queries"],
                         max_per_query=settings["max_questions_per_query"],
                         interval=settings["request_interval"],
+                        log_cb=log,
                     ))
-                    log(f"第一轮采集到 {len(qs)} 条，开始补详情...")
+                    log(f"候选问题 {len(qs)} 条，开始抓取详情...", "info")
+                    if not qs:
+                        log("未搜索到任何问题：请检查关键词或更换网络/稍后重试", "warn")
+                        st.session_state["questions"] = []
+                        st.session_state["resource_qs"] = []
+                        return
 
                     # 并发生详情（限流 3）
+                    progress = {"done": 0, "fail": 0}
+                    total = len(qs)
+
                     async def enrich_all():
                         sem = asyncio.Semaphore(3)
                         async with httpx_async_client() as client:
                             async def work(q):
                                 async with sem:
-                                    return await fetch_question_detail(q, client, 1.5)
+                                    await fetch_question_detail(
+                                        q, client, 1.5, log_cb=log
+                                    )
+                                    progress["done"] += 1
+                                    if progress["done"] % 10 == 0 or progress["done"] == total:
+                                        log(f"详情抓取进度 {progress['done']}/{total}", "debug")
+                                    return q
                             tasks = [work(q) for q in qs]
                             return await asyncio.gather(*tasks)
 
-                    import httpx
                     enriched = asyncio.run(enrich_all())
+
+                    with_title = sum(1 for q in enriched if q.title)
+                    log(f"详情完成：{with_title}/{total} 条拿到标题", "info")
 
                     # 分类
                     resource_qs = []
+                    kw_counter = {}
                     for q in enriched:
                         q.is_resource = classifier.is_resource_request(q.title, q.snippet)
                         q.matched_keywords = classifier.matched_keywords(q.title, q.snippet)
                         if q.is_resource:
                             resource_qs.append(q)
+                            for kw in q.matched_keywords:
+                                kw_counter[kw] = kw_counter.get(kw, 0) + 1
 
                     st.session_state["questions"] = list(enriched)
                     st.session_state["resource_qs"] = resource_qs
-                    log(f"完成！共收集 {len(enriched)} 条，其中资源需求 {len(resource_qs)} 条")
+
+                    log(f"分类完成：资源需求 {len(resource_qs)} 条 / 其他 "
+                        f"{len(enriched) - len(resource_qs)} 条", "success")
+                    if kw_counter:
+                        top = sorted(kw_counter.items(), key=lambda x: -x[1])[:8]
+                        log("命中关键词 TOP: "
+                            + ", ".join(f"{k}×{v}" for k, v in top), "debug")
+                    if not resource_qs:
+                        log("本轮没有识别到求资源的问题，可放宽分类关键词", "warn")
+                    log(f"采集结束，总耗时 {time.time() - t_start:.1f}s", "success")
                 except Exception as e:
-                    log(f"[error] 采集失败: {e}")
+                    log(f"采集失败：{type(e).__name__}: {e}", "error")
+                    import traceback
+                    log(traceback.format_exc().strip().splitlines()[-1], "debug")
                 finally:
                     st.session_state["is_collecting"] = False
 
@@ -244,7 +354,7 @@ with tab1:
         if st.button("🗑️ 清空结果", use_container_width=True):
             st.session_state["questions"] = []
             st.session_state["resource_qs"] = []
-            log("已清空")
+            log("已清空采集结果", "info")
 
     with col2:
         st.write(f"已采集 **{len(st.session_state['questions'])}** 条，"
@@ -291,8 +401,7 @@ with tab1:
 
     # 日志
     with st.expander("📋 运行日志", expanded=False):
-        for line in reversed(st.session_state["log_msgs"][-100:]):
-            st.code(line)
+        render_logs("tab1_logs", height=300)
 
 
 def httpx_async_client():
@@ -434,27 +543,47 @@ def _render_answer_tab():
             st.session_state["answer_logs"] = []
 
             def _run():
+                t_start = time.time()
                 ans = Answerer(
                     cookie=settings["baidu_cookie"],
                     browser_path=settings.get("playwright_browser_path", "playwright-browsers"),
                     headless=settings["playwright_headless"],
                     max_per_question=settings["max_answers_per_question"],
-                    log_callback=log,
+                    log_callback=lambda m: log(
+                        m,
+                        "warn" if any(k in m for k in ("[fail]", "[skip]"))
+                        else "error" if "[error]" in m
+                        else "debug",
+                    ),
                 )
+                pairs_now = list(st.session_state["matched_pairs"])
+                total = len(pairs_now)
+                ok = 0
                 try:
+                    log(f"启动浏览器（headless={settings['playwright_headless']}）", "info")
                     ans.start()
-                    for q, res, score in st.session_state["matched_pairs"]:
+                    log(f"共 {total} 条待答，间隔 {settings['answer_interval']}s", "info")
+                    for i, (q, res, score) in enumerate(pairs_now, 1):
                         text = res.build_answer_text(q.title)
-                        log(f"准备回答: {q.title[:50]}")
+                        log(f"[{i}/{total}] qid={q.qid or '未知'} | 资源《{res.category}》"
+                            f"| 匹配 {score} 分", "info")
+                        t_one = time.time()
                         log_obj = ans.answer(q.url, q.qid, text)
                         st.session_state["answer_logs"].append(log_obj)
-                        time.sleep(settings["answer_interval"] + 2)
+                        if log_obj.success:
+                            ok += 1
+                            log(f"[{i}/{total}] 提交成功，用时 {time.time() - t_one:.1f}s", "success")
+                        else:
+                            log(f"[{i}/{total}] 提交失败或跳过，用时 {time.time() - t_one:.1f}s", "error")
+                        if i < total:
+                            log(f"等待 {settings['answer_interval'] + 2}s 后继续", "debug")
+                            time.sleep(settings["answer_interval"] + 2)
+                    log(f"答题结束：成功 {ok}/{total}，总耗时 {time.time() - t_start:.1f}s", "success")
                 except Exception as e:
-                    log(f"[error] 答题异常: {e}")
+                    log(f"答题异常：{type(e).__name__}: {e}", "error")
                 finally:
                     ans.stop()
                     st.session_state["is_answering"] = False
-                    log("答题流程结束")
 
             threading.Thread(target=_run, daemon=True).start()
 
@@ -465,10 +594,7 @@ def _render_answer_tab():
     with col2:
         if st.session_state["is_answering"]:
             st.info("⏳ 答题进行中...实时日志在下方")
-        if st.session_state["log_msgs"]:
-            st.text_area("📋 实时日志",
-                         "\n".join(reversed(st.session_state["log_msgs"][-80:])),
-                         height=320, disabled=True)
+        render_logs("tab3_logs", height=320)
 
     # 答题结果表
     if st.session_state["answer_logs"]:
