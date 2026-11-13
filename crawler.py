@@ -33,6 +33,20 @@ UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# 支持的来源：检索用 site: 限定，URL 用正则识别（顺便提取 id）
+SOURCES = {
+    "zhidao": {
+        "name": "百度知道",
+        "site": "zhidao.baidu.com",
+        "url_re": r"zhidao\.baidu\.com/question/(\d+)",
+    },
+    "tieba": {
+        "name": "百度贴吧",
+        "site": "tieba.baidu.com",
+        "url_re": r"tieba\.baidu\.com/p/(\d+)",
+    },
+}
+
 # 百度搜索结果页里每一条结果的容器选择器
 RESULT_SELECTOR = "#content_left div.result, #content_left div.c-container"
 
@@ -58,12 +72,13 @@ EXTRACT_JS = r"""
 }).filter(Boolean)
 """
 
-# 问题详情页：标题 + 正文
+# 详情页：标题 + 正文（知道 / 贴吧都覆盖）
 DETAIL_JS = r"""
 () => {
-  const h1 = document.querySelector('h1[class*="title"], h1');
+  const h1 = document.querySelector('h1[class*="title"], h1, .core_title_txt');
   const body = document.querySelector(
-    '.question-content, [class*="question-desc"], .ask-f-desc, .q-content, .rich-content-container'
+    '.question-content, [class*="question-desc"], .ask-f-desc, .q-content, .rich-content-container, '
+    + '.d_post_content, .post_content, .p_content'
   );
   const meta = document.querySelector('meta[name="description"]');
   return {
@@ -82,14 +97,20 @@ class Question:
     title: str = ""
     snippet: str = ""
     source_query: str = ""
+    source: str = "zhidao"        # zhidao / tieba
     # 分类/匹配后填充
     is_resource: bool = False
     matched_keywords: List[str] = field(default_factory=list)
 
     def __post_init__(self):
-        m = re.search(r"/question/(\d+)", self.url)
-        if m and not self.qid:
-            self.qid = m.group(1)
+        if not self.qid:
+            for key, cfg in SOURCES.items():
+                m = re.search(cfg["url_re"], self.url)
+                if m:
+                    self.qid = m.group(1)
+                    if not self.source:
+                        self.source = key
+                    break
 
     def to_dict(self) -> dict:
         return {
@@ -98,6 +119,8 @@ class Question:
             "title": self.title,
             "snippet": self.snippet,
             "source_query": self.source_query,
+            "source": self.source,
+            "source_name": SOURCES.get(self.source, {}).get("name", self.source),
             "is_resource": self.is_resource,
             "matched_keywords": ",".join(self.matched_keywords),
         }
@@ -198,13 +221,13 @@ class Crawler:
             return False
 
     async def _search_one(
-        self, query: str, max_per_query: int, retries: int = 2
+        self, query: str, max_per_query: int, source: str = "zhidao", retries: int = 2
     ) -> tuple[str, List[Question]]:
         """搜索单个关键词；被风控时退避重试。返回 (status, questions)"""
         status = "error"
         for attempt in range(1, retries + 1):
             try:
-                status, res = await self._search_once(query, max_per_query)
+                status, res = await self._search_once(query, max_per_query, source)
             except Exception as e:
                 self._log(f"  搜索异常：{type(e).__name__}: {e}", "error")
                 status, res = "error", []
@@ -224,15 +247,14 @@ class Crawler:
             return status, []
         return status, []
 
-    async def _search_once(self, query: str, max_per_query: int):
-        """单次搜索，返回 (status, questions)；status ∈ ok/empty/blocked/error"""
+    async def _search_once(self, query: str, max_per_query: int, source: str = "zhidao"):
+        """单次搜索指定来源，返回 (status, questions)；status ∈ ok/empty/blocked/error"""
+        cfg = SOURCES[source]
         page = await self._context.new_page()
         try:
             rn = min(max_per_query * 2, 50)
-            url = (
-                "https://www.baidu.com/s?wd="
-                f"{quote('site:zhidao.baidu.com ' + query)}&rn={rn}"
-            )
+            wd = quote("site:%s %s" % (cfg["site"], query))
+            url = "https://www.baidu.com/s?wd=%s&rn=%d" % (wd, rn)
             resp = await page.goto(url, wait_until="domcontentloaded")
             if resp is None:
                 return "error", []
@@ -262,13 +284,16 @@ class Crawler:
             async def one(item):
                 async with sem:
                     real = await self._resolve(item["href"])
-                    if not real or "zhidao.baidu.com/question/" not in real:
+                    if not real or not re.search(cfg["url_re"], real):
                         return None
-                    title = re.sub(r"[-_]\s*百度知道\s*$", "", item["title"]).strip()
+                    title = re.sub(
+                        r"[-_]\s*(百度知道|百度贴吧|贴吧)\s*$", "", item["title"]
+                    ).strip()
                     return Question(
                         url=real,
                         title=title,
                         snippet=item["abstract"][:400],
+                        source=source,
                     )
 
             results = await asyncio.gather(*[one(i) for i in raw])
@@ -287,27 +312,38 @@ class Crawler:
         max_per_query: int = 20,
         interval: float = 3.0,
         progress_cb=None,
+        sources: Optional[List[str]] = None,
     ) -> List[Question]:
-        """按关键词列表检索并全局去重；首轮无结果的词会在冷却后再补搜一轮"""
+        """按关键词 × 来源检索并全局去重；无结果的组合会在冷却后再补搜一轮"""
+        sources = [s for s in (sources or ["zhidao"]) if s in SOURCES]
+        if not sources:
+            sources = ["zhidao"]
+        self._log(
+            "检索来源：" + "、".join(SOURCES[s]["name"] for s in sources),
+            "info",
+        )
+
         all_qs: list[Question] = []
-        pending = list(queries)
+        pending: list[tuple[str, str]] = [(q, s) for q in queries for s in sources]
         for pass_no in (1, 2):
             if not pending:
                 break
             if pass_no == 2:
                 self._log(
-                    f"补搜轮：{len(pending)} 个词上一轮无结果，冷却 30s 后重试", "info"
+                    f"补搜轮：{len(pending)} 个关键词/来源组合上一轮无结果，冷却 30s 后重试",
+                    "info",
                 )
                 await asyncio.sleep(30)
-            retry: list[str] = []
-            for i, q in enumerate(pending, 1):
+            retry: list[tuple[str, str]] = []
+            for i, (q, src) in enumerate(pending, 1):
+                site_name = SOURCES[src]["name"]
                 if progress_cb:
-                    progress_cb(f"搜索中: {q}")
+                    progress_cb(f"搜索中: {q} @{site_name}")
                 tag = "补搜" if pass_no == 2 else ""
-                self._log(f"{tag}[{i}/{len(pending)}] 搜索「{q}」", "info")
+                self._log(f"{tag}[{i}/{len(pending)}] 搜索「{q}」@{site_name}", "info")
                 t0 = time.time()
                 try:
-                    status, res = await self._search_one(q, max_per_query)
+                    status, res = await self._search_one(q, max_per_query, src)
                 except Exception as e:
                     self._log(f"  搜索异常：{type(e).__name__}: {e}", "error")
                     status, res = "error", []
@@ -320,7 +356,7 @@ class Crawler:
                     "info" if res else "warn",
                 )
                 if not res:
-                    retry.append(q)
+                    retry.append((q, src))
                 await asyncio.sleep(interval + random.uniform(0, 1.5))
                 if status == "blocked":
                     # 被风控后立刻搜下一个词会连环触发，先冷却一下
@@ -330,8 +366,9 @@ class Crawler:
             pending = retry
 
         if pending:
+            names = "、".join(f"{q}@{SOURCES[s]['name']}" for q, s in pending[:5])
             self._log(
-                f"{len(pending)} 个词最终无结果：{', '.join(pending[:5])}"
+                f"{len(pending)} 个组合最终无结果：{names}"
                 "（建议换更通用的关键词或稍后再试）",
                 "warn",
             )
@@ -395,6 +432,7 @@ async def collect_questions(
     headless: bool = True,
     browser_dir: str = "playwright-browsers",
     profile_dir: str = "data/browser_profile",
+    sources: Optional[List[str]] = None,
 ) -> List[Question]:
     """一次性采集入口：开浏览器 → 检索 → 补详情 → 关浏览器"""
     async with Crawler(
@@ -403,7 +441,7 @@ async def collect_questions(
         profile_dir=profile_dir,
         log_cb=log_cb,
     ) as c:
-        qs = await c.search(queries, max_per_query, interval, progress_cb)
+        qs = await c.search(queries, max_per_query, interval, progress_cb, sources)
         if qs:
             await c.enrich(qs)
         return qs

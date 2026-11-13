@@ -35,6 +35,7 @@ def main():
         headless=payload.get("headless", True),
         browser_dir=payload.get("browser_dir", "playwright-browsers"),
         profile_dir=payload.get("profile_dir", "data/browser_profile"),
+        sources=payload.get("sources"),
     ))
 
     out_path.write_text(

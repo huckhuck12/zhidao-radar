@@ -116,6 +116,7 @@ def _collect_in_subprocess(payload: dict, on_progress=None):
             title=r.get("title", ""),
             snippet=r.get("snippet", ""),
             source_query=r.get("source_query", ""),
+            source=r.get("source", "zhidao"),
         )
         q.matched_keywords = [k for k in r.get("matched_keywords", "").split(",") if k]
         out.append(q)
@@ -184,6 +185,16 @@ with st.sidebar:
 
     # 搜索词
     st.markdown("#### 🔍 搜索关键词")
+    source_options = {"zhidao": "百度知道", "tieba": "百度贴吧"}
+    picked = st.multiselect(
+        "检索来源",
+        options=list(source_options.keys()),
+        default=[s for s in settings.get("sources", ["zhidao"]) if s in source_options],
+        format_func=lambda k: source_options[k],
+        help="来源越多请求越多，越容易被百度风控",
+    )
+    settings["sources"] = picked or ["zhidao"]
+    config.save(settings)
     queries_input = st.text_area(
         "每行一个",
         value="\n".join(settings.get("search_queries", [])),
@@ -379,6 +390,7 @@ with tab1:
                     "headless": True,
                     "browser_dir": settings.get("playwright_browser_path", "playwright-browsers"),
                     "profile_dir": "data/browser_profile",
+                    "sources": settings.get("sources", ["zhidao"]),
                 },
                 on_progress=_refresh_stream,
             )
@@ -431,8 +443,18 @@ with tab1:
         df = pd.DataFrame([q.to_dict() for q in st.session_state["questions"]])
         # 加一个 tag 列方便看
         df["分类"] = df["is_resource"].map({True: "🔴 资源需求", False: "⚪ 其他"})
-        show_df = df[["分类", "title", "source_query", "matched_keywords", "url"]].rename(
-            columns={"title": "问题标题", "source_query": "搜索词", "matched_keywords": "命中关键词", "url": "链接"}
+        # 来源筛选
+        all_sources = sorted(df["source_name"].dropna().unique().tolist())
+        picked_src = st.multiselect(
+            "按来源筛选", options=all_sources, default=all_sources, key="src_filter"
+        )
+        if picked_src:
+            df = df[df["source_name"].isin(picked_src)]
+        show_df = df[["分类", "source_name", "title", "source_query", "matched_keywords", "url"]].rename(
+            columns={
+                "source_name": "来源", "title": "问题标题", "source_query": "搜索词",
+                "matched_keywords": "命中关键词", "url": "链接",
+            }
         )
         st.dataframe(show_df, use_container_width=True, hide_index=True,
                      column_config={"链接": st.column_config.LinkColumn()})

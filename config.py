@@ -10,6 +10,7 @@ SETTINGS_PATH = Path("data/settings.json")
 
 DEFAULT_SETTINGS = {
     "baidu_cookie": "",
+    "sources": ["zhidao"],                # zhidao / tieba
     "search_queries": [
         "求资源 百度云",
         "求分享 网盘",
