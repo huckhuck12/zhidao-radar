@@ -438,36 +438,33 @@ with tab1:
             f"其中资源需求 **{len(st.session_state['resource_qs'])}** 条"
         )
 
-    # 表格展示
+    # 表格展示（按来源分 Tab）
     if st.session_state["questions"]:
         df = pd.DataFrame([q.to_dict() for q in st.session_state["questions"]])
-        # 加一个 tag 列方便看
         df["分类"] = df["is_resource"].map({True: "🔴 资源需求", False: "⚪ 其他"})
-        # 来源筛选
-        all_sources = sorted(df["source_name"].dropna().unique().tolist())
-        picked_src = st.multiselect(
-            "按来源筛选", options=all_sources, default=all_sources, key="src_filter"
+        # 汇总
+        st.caption(
+            "共 **%d** 条 —— %s"
+            % (
+                len(df),
+                "、".join(
+                    f"{n[0]} {n[1]}"
+                    for n in df["source_name"].value_counts().items()
+                ),
+            )
         )
-        if picked_src:
-            df = df[df["source_name"].isin(picked_src)]
-        show_df = df[["分类", "source_name", "title", "source_query", "matched_keywords", "url"]].rename(
-            columns={
-                "source_name": "来源", "title": "问题标题", "source_query": "搜索词",
-                "matched_keywords": "命中关键词", "url": "链接",
-            }
-        )
-        st.dataframe(show_df, use_container_width=True, hide_index=True,
-                     column_config={"链接": st.column_config.LinkColumn()})
-
-        # 只读模式：导出分析结果
+        # 全局导出放在前面
         if mode == "read":
-            st.markdown("#### 💾 导出结果")
             c1, c2 = st.columns(2)
             with c1:
                 st.download_button(
-                    "⬇️ 下载 CSV",
-                    data=show_df.to_csv(index=False).encode("utf-8-sig"),
-                    file_name=f"zhidao_questions_{time.strftime('%Y%m%d_%H%M')}.csv",
+                    "⬇️ 下载 CSV（全部来源）",
+                    data=df[["分类", "source_name", "title", "source_query", "matched_keywords", "url"]]
+                    .rename(columns={
+                        "source_name": "来源", "title": "问题标题",
+                        "source_query": "搜索词", "matched_keywords": "命中关键词", "url": "链接",
+                    }).to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"questions_{time.strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
@@ -475,13 +472,38 @@ with tab1:
                 st.download_button(
                     "⬇️ 下载 JSON（含正文）",
                     data=json.dumps(
-                        [q.to_dict() | {"snippet": q.snippet} for q in st.session_state["questions"]],
+                        [q.to_dict() for q in st.session_state["questions"]],
                         ensure_ascii=False, indent=2,
                     ).encode("utf-8"),
-                    file_name=f"zhidao_questions_{time.strftime('%Y%m%d_%H%M')}.json",
+                    file_name=f"questions_{time.strftime('%Y%m%d_%H%M')}.json",
                     mime="application/json",
                     use_container_width=True,
                 )
+
+        # 按来源分 Tab
+        src_counts = df["source_name"].value_counts()
+        tabs = st.tabs([f"📖 {name} ({n})" for name, n in src_counts.items()])
+        for tab, (name, _) in zip(tabs, src_counts.items()):
+            with tab:
+                sub = df[df["source_name"] == name]
+                show = sub[["分类", "title", "source_query", "matched_keywords", "url"]].rename(
+                    columns={"title": "问题标题", "source_query": "搜索词",
+                             "matched_keywords": "命中关键词", "url": "链接"}
+                )
+                st.dataframe(
+                    show, use_container_width=True, hide_index=True,
+                    column_config={"链接": st.column_config.LinkColumn()},
+                )
+                # 只读模式支持按来源单独导出
+                if mode == "read":
+                    st.download_button(
+                        f"⬇️ 导出 {name} CSV",
+                        data=show.to_csv(index=False).encode("utf-8-sig"),
+                        file_name=f"{name}_{time.strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv",
+                        key=f"dl_src_{name}",
+                        use_container_width=True,
+                    )
     else:
         st.info("还没采集到数据，点左侧按钮开始吧~")
 
@@ -557,15 +579,29 @@ with tab2:
 # ============================================================
 def _render_answer_tab():
     st.header("🚀 自动答题")
-    st.caption("对已采集的资源需求问题，用资源库匹配生成答案，再用 Playwright 模拟浏览器提交")
+    st.caption(
+        "对已采集的资源需求问题，用资源库匹配生成答案，再用 Playwright 模拟浏览器提交。"
+        "**当前仅支持百度知道**的自动答题；贴吧等其他平台暂未接入，需手动发帖。"
+    )
 
     # 第一步：匹配
     st.subheader("① 资源匹配预览")
     if not st.session_state.get("resource_qs"):
         st.warning("⚠️ 还没有可答的问题，先去「问题检索」Tab 跑一次采集吧")
     else:
+        # 答题目前只支持 zhidao，其他来源的问题只展示但不进入答题
+        source_map = {"zhidao": "百度知道", "tieba": "百度贴吧"}
+        can_answer_qs = [q for q in st.session_state["resource_qs"] if q.source == "zhidao"]
+        blocked_qs = [q for q in st.session_state["resource_qs"] if q.source != "zhidao"]
+        if blocked_qs:
+            st.warning(
+                f"⚠️ 有 {len(blocked_qs)} 条问题来自"
+                f"{'、'.join({source_map.get(q.source, q.source) for q in blocked_qs})}"
+                f"，自动答题暂不支持，将跳过。"
+            )
+
         pairs = []
-        for q in st.session_state["resource_qs"]:
+        for q in can_answer_qs:
             matches = res_db.match(f"{q.title} {q.snippet}", top_k=1)
             if matches:
                 res, score = matches[0]
