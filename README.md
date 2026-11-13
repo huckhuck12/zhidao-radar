@@ -4,7 +4,8 @@
 
 ## ✨ 特性
 
-- 🔍 **双路检索**：百度搜索引擎 + 知道站内搜索，去重合并
+- 🔍 **真实浏览器检索**：Playwright 驱动 Chromium 执行 `site:zhidao.baidu.com` 站内检索，突破 HTTP 空响应与安全验证
+- 🛡️ **风控退避**：遇到百度安全验证自动延迟重试，不硬刚
 - 🎯 **智能分类**：关键词规则识别「求资源/求下载/求分享」类问题
 - 📚 **资源库管理**：按关键词自动匹配最合适的资源
 - 🤖 **自动答题**：Playwright 模拟浏览器提交答案（带资源链接+提取码）
@@ -49,6 +50,7 @@ zhidao-radar/
 ├── classifier.py        # 求资源问题分类器
 ├── resources.py         # 资源库管理
 ├── answerer.py          # Playwright 自动答题
+├── login_helper.py      # 手动登录并保存会话（data/login_state.json）
 ├── config.py            # 设置持久化
 ├── data/
 │   ├── settings.example.json    # 配置模板

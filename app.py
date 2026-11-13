@@ -12,8 +12,10 @@
     Tab 4 统计    → 答题数 / 命中分布
 """
 
-import asyncio
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -24,7 +26,7 @@ import streamlit as st
 import config
 from classifier import QuestionClassifier
 from resources import ResourceDB, Resource
-from crawler import Question, collect_questions, fetch_question_detail
+from crawler import Question
 from answerer import Answerer, AnswerLog
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,69 @@ res_db = ResourceDB()
 classifier = QuestionClassifier()
 
 LOGIN_STATE_PATH = Path("data/login_state.json")
+
+
+def _collect_in_subprocess(payload: dict, on_progress=None):
+    """启动独立采集进程，边跑边把日志转发到面板。
+
+    为什么不直接在当前进程跑：Streamlit(Windows) 会把事件循环策略切成
+    Selector，Selector 循环不支持创建子进程，Playwright 会卡死或直接抛
+    NotImplementedError。独立进程由系统默认的 Proactor 循环启动，稳定可用。
+
+    on_progress: 每收到一行日志回调一次，用于刷新页面上的实时日志。
+    """
+    payload_path = Path("data/.collect_payload.json")
+    result_path = Path("data/.collect_result.json")
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    result_path.unlink(missing_ok=True)
+
+    proc = subprocess.Popen(
+        [sys.executable, "collect_cli.py", str(payload_path), str(result_path)],
+        cwd=str(Path(__file__).resolve().parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env={
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            "PYTHONIOENCODING": "utf-8",
+        },
+    )
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        if "\t" in line:
+            lv, msg = line.split("\t", 1)
+            log(msg, lv if lv in LOG_LEVELS else "info")
+        else:
+            log(line, "debug")
+        if on_progress:
+            on_progress()
+    proc.wait()
+
+    if not result_path.exists():
+        raise RuntimeError(f"采集进程异常退出（code={proc.returncode}）")
+    rows = json.loads(result_path.read_text(encoding="utf-8"))
+    result_path.unlink(missing_ok=True)
+    payload_path.unlink(missing_ok=True)
+
+    out = []
+    for r in rows:
+        q = Question(
+            url=r["url"],
+            qid=r.get("qid", ""),
+            title=r.get("title", ""),
+            snippet=r.get("snippet", ""),
+            source_query=r.get("source_query", ""),
+        )
+        q.matched_keywords = [k for k in r.get("matched_keywords", "").split(",") if k]
+        out.append(q)
+    return out
 
 # ---------------------------------------------------------------------------
 # Sidebar —— 配置面板
@@ -271,96 +336,92 @@ with tab1:
 
     col1, col2 = st.columns([1, 3])
     with col1:
-        if st.button("🚀 开始采集", disabled=st.session_state["is_collecting"],
-                     type="primary", use_container_width=True):
-            st.session_state["is_collecting"] = True
+        do_collect = st.button(
+            "🚀 开始采集",
+            disabled=st.session_state["is_collecting"],
+            type="primary",
+            use_container_width=True,
+        )
+        do_clear = st.button("🗑️ 清空结果", use_container_width=True)
+    with col2:
+        status_ph = st.empty()
+        stream_ph = st.empty()
 
-            def _run():
-                t_start = time.time()
-                try:
-                    log(f"开始采集：{len(settings['search_queries'])} 个搜索词，"
-                        f"每词上限 {settings['max_questions_per_query']} 条", "info")
-                    log(f"节流配置：检索间隔 {settings['request_interval']}s", "debug")
+    if do_clear:
+        st.session_state["questions"] = []
+        st.session_state["resource_qs"] = []
+        log("已清空采集结果", "info")
 
-                    qs = asyncio.run(collect_questions(
-                        queries=settings["search_queries"],
-                        max_per_query=settings["max_questions_per_query"],
-                        interval=settings["request_interval"],
-                        log_cb=log,
-                    ))
-                    log(f"候选问题 {len(qs)} 条，开始抓取详情...", "info")
-                    if not qs:
-                        log("未搜索到任何问题：请检查关键词或更换网络/稍后重试", "warn")
-                        st.session_state["questions"] = []
-                        st.session_state["resource_qs"] = []
-                        return
+    if do_collect:
+        st.session_state["is_collecting"] = True
+        t_start = time.time()
 
-                    # 并发生详情（限流 3）
-                    progress = {"done": 0, "fail": 0}
-                    total = len(qs)
+        def _refresh_stream():
+            """把最近 20 条日志实时刷到页面上"""
+            with _LOG_LOCK:
+                tail = list(LOG_BUFFER)[-20:]
+            stream_ph.text("\n".join(_fmt_log(e) for e in tail))
 
-                    async def enrich_all():
-                        sem = asyncio.Semaphore(3)
-                        async with httpx_async_client() as client:
-                            async def work(q):
-                                async with sem:
-                                    await fetch_question_detail(
-                                        q, client, 1.5, log_cb=log
-                                    )
-                                    progress["done"] += 1
-                                    if progress["done"] % 10 == 0 or progress["done"] == total:
-                                        log(f"详情抓取进度 {progress['done']}/{total}", "debug")
-                                    return q
-                            tasks = [work(q) for q in qs]
-                            return await asyncio.gather(*tasks)
+        try:
+            log(f"开始采集：{len(settings['search_queries'])} 个搜索词，"
+                f"每词上限 {settings['max_questions_per_query']} 条", "info")
+            log(f"节流配置：检索间隔 {settings['request_interval']}s", "debug")
+            _refresh_stream()
 
-                    enriched = asyncio.run(enrich_all())
+            qs = _collect_in_subprocess(
+                {
+                    "queries": settings["search_queries"],
+                    "max_per_query": settings["max_questions_per_query"],
+                    "interval": settings["request_interval"],
+                    "headless": True,
+                    "browser_dir": settings.get("playwright_browser_path", "playwright-browsers"),
+                    "profile_dir": "data/browser_profile",
+                },
+                on_progress=_refresh_stream,
+            )
+            log(f"候选问题 {len(qs)} 条（已去重）", "info")
 
-                    with_title = sum(1 for q in enriched if q.title)
-                    log(f"详情完成：{with_title}/{total} 条拿到标题", "info")
+            if qs:
+                # 分类
+                resource_qs = []
+                kw_counter = {}
+                for q in qs:
+                    q.is_resource = classifier.is_resource_request(q.title, q.snippet)
+                    q.matched_keywords = classifier.matched_keywords(q.title, q.snippet)
+                    if q.is_resource:
+                        resource_qs.append(q)
+                        for kw in q.matched_keywords:
+                            kw_counter[kw] = kw_counter.get(kw, 0) + 1
 
-                    # 分类
-                    resource_qs = []
-                    kw_counter = {}
-                    for q in enriched:
-                        q.is_resource = classifier.is_resource_request(q.title, q.snippet)
-                        q.matched_keywords = classifier.matched_keywords(q.title, q.snippet)
-                        if q.is_resource:
-                            resource_qs.append(q)
-                            for kw in q.matched_keywords:
-                                kw_counter[kw] = kw_counter.get(kw, 0) + 1
+                st.session_state["questions"] = list(qs)
+                st.session_state["resource_qs"] = resource_qs
 
-                    st.session_state["questions"] = list(enriched)
-                    st.session_state["resource_qs"] = resource_qs
+                log(f"分类完成：资源需求 {len(resource_qs)} 条 / 其他 "
+                    f"{len(qs) - len(resource_qs)} 条", "success")
+                if kw_counter:
+                    top = sorted(kw_counter.items(), key=lambda x: -x[1])[:8]
+                    log("命中关键词 TOP: " + ", ".join(f"{k}×{v}" for k, v in top), "debug")
+                if not resource_qs:
+                    log("本轮没有识别到求资源的问题，可放宽分类关键词", "warn")
+            else:
+                st.session_state["questions"] = []
+                st.session_state["resource_qs"] = []
+                log("未搜索到任何问题：请换更通用的关键词，或稍后重试", "warn")
 
-                    log(f"分类完成：资源需求 {len(resource_qs)} 条 / 其他 "
-                        f"{len(enriched) - len(resource_qs)} 条", "success")
-                    if kw_counter:
-                        top = sorted(kw_counter.items(), key=lambda x: -x[1])[:8]
-                        log("命中关键词 TOP: "
-                            + ", ".join(f"{k}×{v}" for k, v in top), "debug")
-                    if not resource_qs:
-                        log("本轮没有识别到求资源的问题，可放宽分类关键词", "warn")
-                    log(f"采集结束，总耗时 {time.time() - t_start:.1f}s", "success")
-                except Exception as e:
-                    log(f"采集失败：{type(e).__name__}: {e}", "error")
-                    import traceback
-                    log(traceback.format_exc().strip().splitlines()[-1], "debug")
-                finally:
-                    st.session_state["is_collecting"] = False
-
-            threading.Thread(target=_run, daemon=True).start()
-
-        if st.button("🗑️ 清空结果", use_container_width=True):
-            st.session_state["questions"] = []
-            st.session_state["resource_qs"] = []
-            log("已清空采集结果", "info")
+            log(f"采集结束，总耗时 {time.time() - t_start:.1f}s", "success")
+        except Exception as e:
+            log(f"采集失败：{type(e).__name__}: {e}", "error")
+            import traceback
+            log(traceback.format_exc().strip().splitlines()[-1], "debug")
+        finally:
+            st.session_state["is_collecting"] = False
+            _refresh_stream()
 
     with col2:
-        st.write(f"已采集 **{len(st.session_state['questions'])}** 条，"
-                 f"其中资源需求 **{len(st.session_state['resource_qs'])}** 条")
-        if st.session_state["is_collecting"]:
-            st.info("⏳ 正在采集中...请稍候")
+        status_ph.write(
+            f"已采集 **{len(st.session_state['questions'])}** 条，"
+            f"其中资源需求 **{len(st.session_state['resource_qs'])}** 条"
+        )
 
     # 表格展示
     if st.session_state["questions"]:
@@ -403,14 +464,6 @@ with tab1:
     with st.expander("📋 运行日志", expanded=False):
         render_logs("tab1_logs", height=300)
 
-
-def httpx_async_client():
-    """返回一个 httpx.AsyncClient 上下文管理器"""
-    import httpx
-    return httpx.AsyncClient(
-        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-CN,zh;q=0.9"},
-        follow_redirects=True, timeout=15,
-    )
 
 # ============================================================
 # Tab 2 —— 资源库管理
