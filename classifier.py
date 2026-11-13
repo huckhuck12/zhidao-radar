@@ -36,6 +36,20 @@ EXCLUDE_KEYWORDS = [
     "好不好", "怎么样", "是什么", "能否", "可不可以",
 ]
 
+# 广告/分享贴信号词（标题命中且不含求助词 → 视为广告贴，只对标题检查）
+# 贴吧尤为严重：大量"XX合集百度网盘免费看"引流贴，不是在求资源
+AD_SHARE_KEYWORDS = [
+    "免费看", "免费观看", "在线看", "在线观看", "资源分享",
+    "自取", "已整理", "合集", "推荐", "盘点", "福利",
+    "速存", "抓紧", "免费下载", "分享给大家", "共享",
+]
+
+# 求助信号词（标题含任一即认为是真实求助，广告规则豁免）
+ASK_KEYWORDS = [
+    "求", "谁有", "跪求", "有无", "有没有", "有木有",
+    "哪位", "大神", "帮忙", "急需", "求发", "找一下",
+]
+
 
 class QuestionClassifier:
     def __init__(self, extra_keywords: list | None = None):
@@ -44,12 +58,28 @@ class QuestionClassifier:
             self.resource_kws.extend(extra_keywords)
         self._res_pats = [re.compile(re.escape(k), re.IGNORECASE) for k in self.resource_kws]
         self._exc_pats = [re.compile(re.escape(k), re.IGNORECASE) for k in EXCLUDE_KEYWORDS]
+        self._ad_pats = [re.compile(re.escape(k), re.IGNORECASE) for k in AD_SHARE_KEYWORDS]
+        self._ask_pats = [re.compile(re.escape(k), re.IGNORECASE) for k in ASK_KEYWORDS]
+
+    def is_ad_share(self, title: str) -> bool:
+        """标题命中广告/分享词且不含求助词 → 广告引流贴，不是真实求助"""
+        title = title or ""
+        for p in self._ask_pats:
+            if p.search(title):
+                return False
+        for p in self._ad_pats:
+            if p.search(title):
+                return True
+        return False
 
     def is_resource_request(self, title: str, content: str = "") -> bool:
         # 标题命中排除词 → 直接排除
         for p in self._exc_pats:
             if p.search(title or ""):
                 return False
+        # 广告分享贴 → 排除
+        if self.is_ad_share(title):
+            return False
         text = f"{title} {content}"
         for p in self._res_pats:
             if p.search(text):

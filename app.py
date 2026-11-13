@@ -26,7 +26,7 @@ import streamlit as st
 import config
 from classifier import QuestionClassifier
 from resources import ResourceDB, Resource
-from crawler import Question
+from crawler import Question, SOURCES
 from answerer import Answerer, AnswerLog
 
 # ---------------------------------------------------------------------------
@@ -400,7 +400,11 @@ with tab1:
                 # 分类
                 resource_qs = []
                 kw_counter = {}
+                ad_counter = {}
                 for q in qs:
+                    if classifier.is_ad_share(q.title):
+                        src_name = SOURCES.get(q.source, {}).get("name", q.source)
+                        ad_counter[src_name] = ad_counter.get(src_name, 0) + 1
                     q.is_resource = classifier.is_resource_request(q.title, q.snippet)
                     q.matched_keywords = classifier.matched_keywords(q.title, q.snippet)
                     if q.is_resource:
@@ -413,6 +417,9 @@ with tab1:
 
                 log(f"分类完成：资源需求 {len(resource_qs)} 条 / 其他 "
                     f"{len(qs) - len(resource_qs)} 条", "success")
+                if ad_counter:
+                    log("过滤广告分享贴 "
+                        + "、".join(f"{k} {v} 条" for k, v in ad_counter.items()), "info")
                 if kw_counter:
                     top = sorted(kw_counter.items(), key=lambda x: -x[1])[:8]
                     log("命中关键词 TOP: " + ", ".join(f"{k}×{v}" for k, v in top), "debug")
@@ -441,7 +448,11 @@ with tab1:
     # 表格展示（按来源分 Tab）
     if st.session_state["questions"]:
         df = pd.DataFrame([q.to_dict() for q in st.session_state["questions"]])
-        df["分类"] = df["is_resource"].map({True: "🔴 资源需求", False: "⚪ 其他"})
+        df["分类"] = df.apply(
+            lambda r: "🚫 广告贴" if classifier.is_ad_share(r["title"])
+            else ("🔴 资源需求" if r["is_resource"] else "⚪ 其他"),
+            axis=1,
+        )
         # 汇总
         st.caption(
             "共 **%d** 条 —— %s"
