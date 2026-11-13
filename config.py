@@ -17,8 +17,8 @@ DEFAULT_SETTINGS = {
         "跪求 链接",
         "求下载 资源",
     ],
-    "max_questions_per_query": 30,       # int
-    "request_interval": 3.0,             # float
+    "max_questions_per_query": 15,       # int
+    "request_interval": 8.0,             # float，低于 5s 很容易触发百度安全验证
     "answer_interval": 15.0,             # float
     "max_answers_per_question": 3,       # int
     "playwright_headless": True,

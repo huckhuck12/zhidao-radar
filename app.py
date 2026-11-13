@@ -188,6 +188,7 @@ with st.sidebar:
         "每行一个",
         value="\n".join(settings.get("search_queries", [])),
         height=100,
+        help="建议每次 3-5 个词，词越多越容易触发百度安全验证",
     )
     queries = [q.strip() for q in queries_input.split("\n") if q.strip()]
     settings["search_queries"] = queries
@@ -198,12 +199,14 @@ with st.sidebar:
     settings["max_questions_per_query"] = st.number_input(
         "每个搜索词最多采集",
         min_value=5, max_value=100, step=5,
-        value=int(settings.get("max_questions_per_query", 30)),
+        value=int(settings.get("max_questions_per_query", 15)),
+        help="值越大单次请求返回的结果越多，越容易被百度风控。建议 10-20",
     )
     settings["request_interval"] = st.number_input(
         "检索请求间隔（秒）",
         min_value=1.0, max_value=30.0, step=1.0,
-        value=float(settings.get("request_interval", 3.0)),
+        value=float(settings.get("request_interval", 8.0)),
+        help="建议 8-10 秒。低于 5 秒连续搜索很容易触发百度安全验证",
     )
     if mode == "answer":
         settings["answer_interval"] = st.number_input(
