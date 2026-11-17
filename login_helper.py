@@ -1,16 +1,21 @@
 """
-登录助手 —— 打开浏览器让你手动登录百度，保存会话到 data/login_state.json
+登录助手 —— 打开浏览器让你手动登录百度，自动检测并保存会话到 data/login_state.json
 
-之后 Answerer 会自动加载这个文件，无需再手动复制 Cookie。
+不再依赖终端回车：每 2 秒轮询 BDUSS Cookie，检测到登录立即保存并关闭浏览器。
 
 用法:
     venv\\Scripts\\python.exe login_helper.py
 """
 
+import time
 from pathlib import Path
+
 from playwright.sync_api import sync_playwright
 
 STATE_PATH = Path("data/login_state.json")
+POLL_INTERVAL = 2          # 秒
+REPORT_INTERVAL = 15       # 每隔多久打印一次等待提示
+TIMEOUT_SECONDS = 600      # 最长等待 10 分钟
 
 
 def _find_chromium() -> str | None:
@@ -20,6 +25,17 @@ def _find_chromium() -> str | None:
     for p in base.rglob("chrome.exe"):
         return str(p)
     return None
+
+
+def _has_login(context) -> bool:
+    """百度登录后会有 BDUSS Cookie"""
+    try:
+        for c in context.cookies():
+            if c.get("name") == "BDUSS" and c.get("value"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def main():
@@ -46,20 +62,44 @@ def main():
         print("1. 浏览器会打开百度首页")
         print("2. 点击右上角「登录」，选择任意方式登录")
         print("   （扫码 / 账号密码 / 短信验证码 都行）")
-        print("3. 登录成功后，随便点开一个百度知道的问题页确认能答题")
-        print("4. 回到终端，按回车键保存会话")
-        print("=" * 60 + "\n")
+        print("3. 登录成功后不用按回车，程序会自动检测并保存")
+        print("=" * 60 + "\n", flush=True)
 
         page.goto("https://www.baidu.com", wait_until="domcontentloaded")
+        print(f"⏳ 等待登录中（最长 {TIMEOUT_SECONDS // 60} 分钟）...", flush=True)
 
-        input("✋ 登录完成后按回车键继续... ")
+        deadline = time.time() + TIMEOUT_SECONDS
+        start = time.time()
+        last_report = 0.0
 
-        # 保存会话
-        context.storage_state(path=str(STATE_PATH))
-        print(f"\n✅ 登录会话已保存到: {STATE_PATH}")
-        print("   下次启动答题时会自动加载，无需再登录\n")
+        while time.time() < deadline:
+            if _has_login(context):
+                context.storage_state(path=str(STATE_PATH))
+                print(f"\n✅ 登录成功，会话已保存到: {STATE_PATH}", flush=True)
+                print("   下次启动答题会自动加载，无需再登录\n", flush=True)
+                browser.close()
+                return
 
-        browser.close()
+            try:
+                if page.is_closed():
+                    print("\n⚠️ 浏览器被关闭，未检测到登录", flush=True)
+                    return
+            except Exception:
+                print("\n⚠️ 浏览器已断开，未检测到登录", flush=True)
+                return
+
+            elapsed = int(time.time() - start)
+            if elapsed - last_report >= REPORT_INTERVAL:
+                last_report = elapsed
+                print(f"   ...已等待 {elapsed}s，尚未检测到登录", flush=True)
+
+            time.sleep(POLL_INTERVAL)
+
+        print(f"\n❌ 超时（{TIMEOUT_SECONDS}s）未检测到登录，请重试", flush=True)
+        try:
+            browser.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

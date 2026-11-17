@@ -20,6 +20,7 @@ data/resources.json
 data/collected.json
 data/answered.json
 data/login_state.json
+data/pan_cookies.json
 data/.collect_payload.json
 data/.collect_result.json
 
